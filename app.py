@@ -1,15 +1,19 @@
 import collections
+import time
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
-# Shared queue per base_sid: deque of (byte_A, byte_B)
+# Storage for queues and signals
 queues = collections.defaultdict(collections.deque)
-current_signals = collections.defaultdict(lambda: {"A": "00000000", "B": "00000000"})
+current_signal = collections.defaultdict(lambda: "00000000")
+last_pop_time = collections.defaultdict(float)
 last_roblox_ping = collections.defaultdict(lambda: "Never")
 
-# --- CUSTOM CHARACTER & SYMBOL MAPPING (For Typewriter) ---
+INTERVAL_SEC = 0.35  # Stable 350 ms interval per step (active -> pause)
+
+# --- CUSTOM CHARACTER & SYMBOL MAPPING ---
 def get_char_mapping(char):
     if 'a' <= char <= 'z':
         idx = ord(char) - ord('a') + 1
@@ -50,6 +54,11 @@ def get_char_mapping(char):
     return '000000', False
 
 def text_to_8bit_steps(char):
+    """
+    Creates two 8-bit steps for the queue (Reversed for Roblox right-to-left output):
+    Step 1: [Bits 1-6 symbol] + [Bit 7 shift] + [Bit 8 Clock=1] (Active)
+    Step 2: 00000000 (Clock=0 Pause, ensuring distinct edge trigger)
+    """
     bits_6, is_shift = get_char_mapping(char)
     shift_bit = "1" if is_shift else "0"
     clock_active = "1"
@@ -58,343 +67,75 @@ def text_to_8bit_steps(char):
     pause_byte = "00000000"
     return active_byte, pause_byte
 
-# --- COLOR PALETTE MAPPING ---
-COLOR_MAP = {
-    "black": "000000",
-    "white": "111111",
-    "dim_white": "111000",
-    "red": "100000",
-    "green": "010000",
-    "blue": "001000",
-    "cyan": "011000",
-    "magenta": "101000",
-    "yellow": "110000",
-    "maroon": "000100",
-    "grey": "000111",
-    "lavender": "001100",
-    "sky_blue": "011100",
-    "orange": "100010",
-    "pink": "111100",
-    "beige": "110001"
-}
-
-def color_to_8bit(color_name, reset_active=False):
-    c_bits = COLOR_MAP.get(color_name, "000000")
-    r_bit = "1" if reset_active else "0"
-    unused_bit = "0"
-    return (c_bits + r_bit + unused_bit)[::-1]
-
-def get_reset_steps():
-    """
-    Sends a reset frame: Bit 7 on Transmitter B high, Transmitter A low (Clock=0).
-    Resets write pointer to (0,0) without consuming clock cycles.
-    """
-    reset_on = color_to_8bit("black", reset_active=True)
-    reset_off = color_to_8bit("black", reset_active=False)
-    return [
-        ("00000000", reset_on),
-        ("00000000", reset_off)
-    ]
-
-# --- HTML TEMPLATES ---
-
-MAIN_HUB_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Build Logic - Control Hub</title>
-    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@500;700&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Inter', sans-serif; background-color: #0b0f19; color: #c9d1d9; padding: 40px 20px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        h1 { font-size: 28px; color: #58a6ff; margin-bottom: 8px; text-align: center; }
-        p.subtitle { text-align: center; color: #8b949e; margin-bottom: 30px; font-size: 15px; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 30px; }
-        @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
-        .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
-        .card h3 { color: #58a6ff; font-size: 18px; margin-bottom: 8px; }
-        .card p { color: #8b949e; font-size: 13px; margin-bottom: 14px; line-height: 1.4; }
-        .btn { display: inline-block; padding: 10px 16px; border-radius: 6px; background: #238636; color: #fff; font-weight: 600; text-decoration: none; font-size: 14px; text-align: center; width: 100%; }
-        .btn:hover { background: #2ea043; }
-        .btn-secondary { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; }
-        .instructions { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; }
-        .instructions h2 { font-size: 18px; color: #f0f6fc; margin-bottom: 12px; }
-        .instructions ol { padding-left: 20px; color: #8b949e; font-size: 14px; line-height: 1.6; }
-        code { font-family: 'Fira Code', monospace; background: #0d1117; padding: 2px 6px; border-radius: 4px; color: #3fb950; border: 1px solid #30363d; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🌐 Build Logic Control Hub</h1>
-        <p class="subtitle">External web controller for Roblox HTTP Transmitters</p>
-        <div class="grid">
-            <div class="card">
-                <h3>⌨️ Typewriter</h3>
-                <p>Monochrome text transmission with full symbol support.</p>
-                <a href="/typewriter" class="btn">Open Typewriter</a>
-            </div>
-            <div class="card">
-                <h3>🎨 Colored Typewriter</h3>
-                <p>16x16 RGB Panel grid painting tool with precise pixel alignment.</p>
-                <a href="/colored-typewriter" class="btn">Open Panel</a>
-            </div>
-            <div class="card">
-                <h3>⚡ Upgraded Typewriter</h3>
-                <p>Advanced real-time pixel updating with coordinate mapping.</p>
-                <a href="/upgraded-typewriter" class="btn btn-secondary">Coming Soon</a>
-            </div>
-            <div class="card">
-                <h3>🎮 Game Engine</h3>
-                <p>Two-way communication, button inputs, and minigames hub.</p>
-                <a href="/game-engine" class="btn btn-secondary">Coming Soon</a>
-            </div>
-        </div>
-        <div class="instructions">
-            <h2>⚙️ Roblox Setup</h2>
-            <ol>
-                <li>URL Endpoint for transmitters: <br><code>{{ base_url }}/api/typewriter</code></li>
-                <li>Transmitter A Header: <code>SID: MY_SESSION_A</code> (Clock / Pulse)</li>
-                <li>Transmitter B Header: <code>SID: MY_SESSION_B</code> (Color + Reset Bit 7)</li>
-            </ol>
-        </div>
-    </div>
-</body>
-</html>
-"""
+# --- HTML TEMPLATE ---
 
 TYPEWRITER_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Typewriter - Build Logic Hub</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Build Logic - Typewriter Hub</title>
     <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@500;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Inter', sans-serif; background-color: #0b0f19; color: #c9d1d9; padding: 30px; }
-        .container { max-width: 600px; margin: 0 auto; background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; }
-        .back-link { display: inline-block; color: #58a6ff; text-decoration: none; font-size: 13px; margin-bottom: 16px; }
-        h1 { font-size: 20px; color: #58a6ff; margin-bottom: 20px; text-align: center; }
+        body { font-family: 'Inter', sans-serif; background-color: #0b0f19; color: #c9d1d9; padding: 40px 20px; }
+        .container { max-width: 600px; margin: 0 auto; background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 30px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+        h1 { font-size: 22px; color: #58a6ff; margin-bottom: 6px; text-align: center; }
+        p.subtitle { text-align: center; color: #8b949e; margin-bottom: 24px; font-size: 13px; }
         label { display: block; font-size: 13px; color: #8b949e; margin-bottom: 6px; }
         input[type=text] { width: 100%; padding: 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #f0f6fc; font-family: 'Fira Code', monospace; font-size: 15px; margin-bottom: 16px; }
+        input[type=text]:focus { border-color: #58a6ff; outline: none; }
         button { width: 100%; padding: 12px; border-radius: 6px; border: none; font-weight: 600; background: #238636; color: #fff; cursor: pointer; font-size: 15px; }
         button:hover { background: #2ea043; }
-        .status-box { margin-top: 20px; padding: 16px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; text-align: center; }
+        .status-box { margin-top: 24px; padding: 16px; background: #0d1117; border: 1px solid #21262d; border-radius: 8px; text-align: center; }
         .binary-display { font-family: 'Fira Code', monospace; font-size: 28px; color: #3fb950; letter-spacing: 4px; margin: 10px 0; }
         .info { font-size: 13px; color: #8b949e; margin-top: 6px; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #21262d; color: #f2cc60; border: 1px solid #30363d; }
+        .setup-guide { margin-top: 24px; border-top: 1px solid #30363d; padding-top: 16px; font-size: 13px; color: #8b949e; line-height: 1.5; }
+        .setup-guide code { font-family: 'Fira Code', monospace; background: #0d1117; padding: 2px 6px; border-radius: 4px; color: #3fb950; border: 1px solid #30363d; }
     </style>
     <script>
         setInterval(async () => {
             let sid = document.getElementById('sid-input').value.trim();
             if(!sid) return;
             try {
-                let res = await fetch('/api/typewriter/status?sid=' + encodeURIComponent(sid + 'A'));
+                let res = await fetch('/api/typewriter/status?sid=' + encodeURIComponent(sid));
                 let data = await res.json();
                 document.getElementById('binary-val').innerText = data.current_signal;
                 document.getElementById('queue-len').innerText = data.queue_len;
                 document.getElementById('last-ping').innerText = data.last_ping;
             } catch(e) {}
-        }, 200);
+        }, 300);
     </script>
 </head>
 <body>
     <div class="container">
-        <a href="/" class="back-link">← Back to Hub</a>
-        <h1>⌨️ Typewriter Panel</h1>
+        <h1>⌨️ Build Logic Typewriter</h1>
+        <p class="subtitle">Direct web controller for Roblox HTTP Transmitters</p>
+        
         <form method="POST" action="/typewriter/send">
             <label>Session ID (SID):</label>
             <input type="text" id="sid-input" name="sid" placeholder="e.g. my_game" value="{{ sid }}" required autocomplete="off">
+            
             <label>Text to send into Roblox:</label>
             <input type="text" name="text" placeholder="Type something..." required autocomplete="off">
+            
             <button type="submit">Enqueue Text</button>
         </form>
+
         <div class="status-box">
-            <div class="info">Transmitter A Signal (8-bit):</div>
+            <div class="info">Current Active Signal (8-bit):</div>
             <div class="binary-display" id="binary-val">00000000</div>
-            <div class="info">Remaining Steps: <span id="queue-len">0</span></div>
-            <div class="info" style="margin-top: 8px;">Last Roblox Ping: <span id="last-ping" style="color:#58a6ff;">Never</span></div>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-COLORED_TYPEWRITER_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Colored Typewriter - Build Logic Hub</title>
-    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@500;700&family=Inter:wght@400;600&display=swap" rel="stylesheet">
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: 'Inter', sans-serif; background-color: #0b0f19; color: #c9d1d9; padding: 20px; }
-        .container { max-width: 850px; margin: 0 auto; background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 24px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
-        .back-link { display: inline-block; color: #58a6ff; text-decoration: none; font-size: 13px; margin-bottom: 12px; }
-        h1 { font-size: 22px; color: #58a6ff; margin-bottom: 16px; text-align: center; }
-        
-        .section-card { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
-        .section-title { font-size: 14px; color: #f0f6fc; font-weight: 600; margin-bottom: 10px; }
-        
-        label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 4px; }
-        input[type=text] { width: 100%; padding: 10px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #f0f6fc; font-family: 'Fira Code', monospace; font-size: 14px; margin-bottom: 10px; }
-        
-        .palette { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
-        .color-btn { width: 30px; height: 30px; border-radius: 6px; border: 2px solid #30363d; cursor: pointer; }
-        .color-btn.active { border-color: #58a6ff; transform: scale(1.1); }
-        
-        .grid-16 { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; background: #0d1117; padding: 10px; border-radius: 8px; border: 1px solid #30363d; margin-bottom: 15px; }
-        .pixel { aspect-ratio: 1; background: #161b22; border: 1px solid #21262d; border-radius: 3px; cursor: pointer; }
-        .pixel:hover { border-color: #58a6ff; }
-        
-        .toggle-group { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; font-size: 13px; color: #c9d1d9; cursor: pointer; }
-        .toggle-group input { width: 18px; height: 18px; accent-color: #238636; cursor: pointer; }
-
-        .btn-group { display: flex; gap: 10px; }
-        button { flex: 1; padding: 12px; border-radius: 6px; border: none; font-weight: 600; background: #238636; color: #fff; cursor: pointer; font-size: 14px; }
-        button:hover { background: #2ea043; }
-        .btn-danger { background: #da3633; }
-        .btn-danger:hover { background: #f85149; }
-    </style>
-    <script>
-        let selectedColor = 'white';
-
-        function setPaletteColor(name, hex, el) {
-            selectedColor = name;
-            document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
-            el.classList.add('active');
-        }
-
-        document.addEventListener("DOMContentLoaded", () => {
-            const gridEl = document.getElementById('grid-16');
-            for(let i=0; i<256; i++) {
-                let p = document.createElement('div');
-                p.className = 'pixel';
-                p.style.backgroundColor = '#000000';
-                p.dataset.colorName = 'black';
-                p.addEventListener('click', () => {
-                    p.style.backgroundColor = getHex(selectedColor);
-                    p.dataset.colorName = selectedColor;
-                });
-                gridEl.appendChild(p);
-            }
-        });
-
-        function getHex(name) {
-            const map = {
-                black: '#000000', white: '#ffffff', dim_white: '#cccccc', red: '#ff0000',
-                green: '#00ff00', blue: '#0000ff', cyan: '#00ffff', magenta: '#ff00ff',
-                yellow: '#ffff00', maroon: '#800000', grey: '#808080', lavender: '#e6e6fa',
-                sky_blue: '#87ceeb', orange: '#ffa500', pink: '#ffc0cb', beige: '#f5f5dc'
-            };
-            return map[name] || '#000000';
-        }
-
-        async function sendGrid() {
-            let sid = document.getElementById('sid-input').value.trim();
-            let autoReset = document.getElementById('auto-reset-toggle').checked;
-            if(!sid) { alert("Please enter Session ID (SID)"); return; }
-
-            let pixels = [];
-            document.querySelectorAll('.pixel').forEach(p => pixels.push(p.dataset.colorName));
-
-            let res = await fetch('/api/colored-typewriter/send-grid', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    sid: sid,
-                    pixels: pixels,
-                    auto_reset: autoReset
-                })
-            });
-            let data = await res.json();
-            alert("Grid paint enqueued cleanly! Queue length: " + data.queue_len);
-        }
-
-        async function triggerReset() {
-            let sid = document.getElementById('sid-input').value.trim();
-            if(!sid) { alert("Please enter SID"); return; }
-            await fetch('/api/colored-typewriter/reset', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({sid: sid})
-            });
-            alert("Manual reset signal sent to panel!");
-        }
-    </script>
-</head>
-<body>
-    <div class="container">
-        <a href="/" class="back-link">← Back to Hub</a>
-        <h1>🎨 Colored Typewriter Panel (16x16 Grid)</h1>
-        
-        <div style="margin-bottom: 15px;">
-            <label>Session ID (SID):</label>
-            <input type="text" id="sid-input" placeholder="e.g. my_game" value="{{ sid }}" autocomplete="off">
+            <div class="info">Remaining in Queue: <span id="queue-len" class="badge">0</span> steps</div>
+            <div class="info" style="margin-top: 10px;">Last Roblox Connection: <span id="last-ping" style="color: #58a6ff;">Never</span></div>
         </div>
 
-        <div class="section-card">
-            <div class="section-title">1. Choose Active Paint Color</div>
-            <div class="palette">
-                <div class="color-btn" style="background:#000000;" onclick="setPaletteColor('black', '#000000', this)"></div>
-                <div class="color-btn active" style="background:#ffffff;" onclick="setPaletteColor('white', '#ffffff', this)"></div>
-                <div class="color-btn" style="background:#ff0000;" onclick="setPaletteColor('red', '#ff0000', this)"></div>
-                <div class="color-btn" style="background:#00ff00;" onclick="setPaletteColor('green', '#00ff00', this)"></div>
-                <div class="color-btn" style="background:#0000ff;" onclick="setPaletteColor('blue', '#0000ff', this)"></div>
-                <div class="color-btn" style="background:#00ffff;" onclick="setPaletteColor('cyan', '#00ffff', this)"></div>
-                <div class="color-btn" style="background:#ff00ff;" onclick="setPaletteColor('magenta', '#ff00ff', this)"></div>
-                <div class="color-btn" style="background:#ffff00;" onclick="setPaletteColor('yellow', '#ffff00', this)"></div>
-                <div class="color-btn" style="background:#800000;" onclick="setPaletteColor('maroon', '#800000', this)"></div>
-                <div class="color-btn" style="background:#808080;" onclick="setPaletteColor('grey', '#808080', this)"></div>
-                <div class="color-btn" style="background:#e6e6fa;" onclick="setPaletteColor('lavender', '#e6e6fa', this)"></div>
-                <div class="color-btn" style="background:#87ceeb;" onclick="setPaletteColor('sky_blue', '#87ceeb', this)"></div>
-                <div class="color-btn" style="background:#ffa500;" onclick="setPaletteColor('orange', '#ffa500', this)"></div>
-                <div class="color-btn" style="background:#ffc0cb;" onclick="setPaletteColor('pink', '#ffc0cb', this)"></div>
-                <div class="color-btn" style="background:#f5f5dc;" onclick="setPaletteColor('beige', '#f5f5dc', this)"></div>
-            </div>
+        <div class="setup-guide">
+            <b>Roblox Transmitter Setup:</b><br>
+            • Endpoint URL: <code>{{ base_url }}/api/typewriter</code><br>
+            • Header SID: <code>MY_SESSION</code> (Enter matching SID above)
         </div>
-
-        <div class="section-card">
-            <div class="section-title">2. 16x16 Grid Paint Tool</div>
-            <div id="grid-16" class="grid-16"></div>
-            <div class="btn-group">
-                <button onclick="sendGrid()">🚀 Send Grid Paint</button>
-                <button class="btn-danger" onclick="triggerReset()">🔄 Trigger Manual Reset</button>
-            </div>
-        </div>
-
-        <label class="toggle-group">
-            <input type="checkbox" id="auto-reset-toggle" checked>
-            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B to reset write pointer to 0,0 without advancing clock)</span>
-        </label>
-    </div>
-</body>
-</html>
-"""
-
-STUB_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>{{ title }}</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Inter', sans-serif; background-color: #0b0f19; color: #c9d1d9; padding: 50px; text-align: center; }
-        .container { max-width: 500px; margin: 0 auto; background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 30px; }
-        h1 { color: #58a6ff; font-size: 22px; margin-bottom: 12px; }
-        a { color: #58a6ff; text-decoration: none; font-weight: 600; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>{{ title }}</h1>
-        <p style="color: #8b949e; margin-bottom: 20px;">Coming up next in our step-by-step plan!</p>
-        <a href="/">← Return to Hub</a>
     </div>
 </body>
 </html>
@@ -405,25 +146,8 @@ STUB_TEMPLATE = """
 @app.route('/')
 def main_hub():
     base_url = request.host_url.rstrip('/')
-    return render_template_string(MAIN_HUB_TEMPLATE, base_url=base_url)
-
-@app.route('/typewriter')
-def typewriter_page():
     sid = request.args.get('sid', '')
-    return render_template_string(TYPEWRITER_TEMPLATE, sid=sid)
-
-@app.route('/colored-typewriter')
-def colored_typewriter_page():
-    sid = request.args.get('sid', '')
-    return render_template_string(COLORED_TYPEWRITER_TEMPLATE, sid=sid)
-
-@app.route('/upgraded-typewriter')
-def upgraded_typewriter():
-    return render_template_string(STUB_TEMPLATE, title="Upgraded Typewriter")
-
-@app.route('/game-engine')
-def game_engine():
-    return render_template_string(STUB_TEMPLATE, title="Game Engine")
+    return render_template_string(TYPEWRITER_TEMPLATE, base_url=base_url, sid=sid)
 
 @app.route('/typewriter/send', methods=['POST'])
 def send_text():
@@ -431,100 +155,42 @@ def send_text():
     text = request.form.get('text', '')
     
     if sid and text:
-        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
-        queues[base_sid].clear()
-        
-        steps = []
+        # Clear previous queue on new send so it overwrites immediately
+        queues[sid].clear()
         for char in text:
             active_step, pause_step = text_to_8bit_steps(char)
-            steps.append((active_step, "00000000"))
-            steps.append((pause_step, "00000000"))
-        queues[base_sid].extend(steps)
+            queues[sid].append(active_step)
+            queues[sid].append(pause_step)
 
-    return f"<script>window.location.href='/typewriter?sid={sid}';</script>"
+    return f"<script>window.location.href='/?sid={sid}';</script>"
 
-@app.route('/api/colored-typewriter/send-grid', methods=['POST'])
-def api_send_colored_grid():
-    data = request.get_json() or {}
-    sid = data.get('sid', '').strip()
-    pixels = data.get('pixels', [])
-    auto_reset = data.get('auto_reset', True)
-
-    if sid and pixels:
-        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
-        queues[base_sid].clear()
-
-        steps = []
-        if auto_reset:
-            steps.extend(get_reset_steps())
-
-        # EVENT-DRIVEN CLOCK PULSE: 2 steps per pixel (Active High -> Pause Low)
-        clock_active_a = "10000000"
-        clock_pause_a = "00000000"
-
-        for col_name in pixels:
-            color_byte = color_to_8bit(col_name, reset_active=False)
-            # Step 1: Clock High (Pulse ON)
-            steps.append((clock_active_a, color_byte))
-            # Step 2: Clock Low (Pulse OFF / Pause)
-            steps.append((clock_pause_a, color_byte))
-
-        queues[base_sid].extend(steps)
-        return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
-
-    return jsonify({"status": "error"}), 400
-
-@app.route('/api/colored-typewriter/reset', methods=['POST'])
-def api_reset_signal():
-    data = request.get_json() or {}
-    sid = data.get('sid', '').strip()
-    if sid:
-        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
-        queues[base_sid].clear()
-        queues[base_sid].extend(get_reset_steps())
-
-    return jsonify({"status": "reset_sent"})
-
-# --- UNIFIED EVENT-DRIVEN ROBLOX HTTP TRANSMITTER ENDPOINT ---
+# --- ROBLOX HTTP TRANSMITTER API ENDPOINT ---
 @app.route('/api/typewriter', methods=['GET'])
 def get_typewriter_signal():
-    header_sid = request.headers.get('SID', '').strip()
-    if not header_sid:
+    sid = request.headers.get('SID', '').strip()
+    
+    if not sid:
         return jsonify({"value": "00000000"})
 
-    if header_sid.endswith('A') or header_sid.endswith('B'):
-        base_sid = header_sid[:-1]
-        channel = header_sid[-1]
-    else:
-        base_sid = header_sid
-        channel = 'A'
+    last_roblox_ping[sid] = datetime.now().strftime("%H:%M:%S")
 
-    last_roblox_ping[base_sid] = datetime.now().strftime("%H:%M:%S")
+    now = time.time()
+    if now - last_pop_time[sid] >= INTERVAL_SEC:
+        if queues[sid]:
+            current_signal[sid] = queues[sid].popleft()
+            last_pop_time[sid] = now
+        else:
+            current_signal[sid] = "00000000"
 
-    if queues[base_sid]:
-        byte_a, byte_b = queues[base_sid].popleft()
-        current_signals[base_sid]["A"] = byte_a
-        current_signals[base_sid]["B"] = byte_b
-    else:
-        current_signals[base_sid]["A"] = "00000000"
-        current_signals[base_sid]["B"] = "00000000"
-
-    return jsonify({"value": current_signals[base_sid][channel]})
+    return jsonify({"value": current_signal[sid]})
 
 @app.route('/api/typewriter/status', methods=['GET'])
 def typewriter_status():
     sid = request.args.get('sid', '').strip()
-    if sid.endswith('A') or sid.endswith('B'):
-        base_sid = sid[:-1]
-        channel = sid[-1]
-    else:
-        base_sid = sid
-        channel = 'A'
-
     return jsonify({
-        "current_signal": current_signals[base_sid][channel],
-        "queue_len": len(queues[base_sid]),
-        "last_ping": last_roblox_ping[base_sid]
+        "current_signal": current_signal[sid],
+        "queue_len": len(queues[sid]),
+        "last_ping": last_roblox_ping[sid]
     })
 
 if __name__ == '__main__':
