@@ -1,5 +1,4 @@
 import collections
-import time
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 
@@ -8,10 +7,7 @@ app = Flask(__name__)
 # Shared queue per base_sid: deque of (byte_A, byte_B)
 queues = collections.defaultdict(collections.deque)
 current_signals = collections.defaultdict(lambda: {"A": "00000000", "B": "00000000"})
-last_pop_time = collections.defaultdict(float)
 last_roblox_ping = collections.defaultdict(lambda: "Never")
-
-INTERVAL_SEC = 0.20  # 200 ms interval per step
 
 # --- CUSTOM CHARACTER & SYMBOL MAPPING (For Typewriter) ---
 def get_char_mapping(char):
@@ -456,22 +452,18 @@ def api_send_colored_grid():
 
     if sid and pixels:
         base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
-        
-        # Clear previous queue
         queues[base_sid].clear()
 
         steps = []
         if auto_reset:
             steps.extend(get_reset_steps())
 
-        # Exact 10000000 (Bit 8 Clock active) and 00000000 (Clock low) for pixel timing
-        clock_active = "10000000"
-        clock_pause = "00000000"
-
+        # EVENT-DRIVEN POLLING: Each pixel is exactly 1 step in the queue!
+        # When Roblox polls via GET, it consumes this step directly.
         for col_name in pixels:
             color_byte = color_to_8bit(col_name, reset_active=False)
-            steps.append((clock_active, color_byte))
-            steps.append((clock_pause, color_byte))
+            # Transmitter A = Clock Active (10000000), Transmitter B = Color Byte
+            steps.append(("10000000", color_byte))
 
         queues[base_sid].extend(steps)
         return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
@@ -489,7 +481,7 @@ def api_reset_signal():
 
     return jsonify({"status": "reset_sent"})
 
-# --- UNIFIED ROBLOX HTTP TRANSMITTER ENDPOINT ---
+# --- UNIFIED EVENT-DRIVEN ROBLOX HTTP TRANSMITTER ENDPOINT ---
 @app.route('/api/typewriter', methods=['GET'])
 def get_typewriter_signal():
     header_sid = request.headers.get('SID', '').strip()
@@ -505,16 +497,14 @@ def get_typewriter_signal():
 
     last_roblox_ping[base_sid] = datetime.now().strftime("%H:%M:%S")
 
-    now = time.time()
-    if now - last_pop_time[base_sid] >= INTERVAL_SEC:
-        if queues[base_sid]:
-            byte_a, byte_b = queues[base_sid].popleft()
-            current_signals[base_sid]["A"] = byte_a
-            current_signals[base_sid]["B"] = byte_b
-            last_pop_time[base_sid] = now
-        else:
-            current_signals[base_sid]["A"] = "00000000"
-            current_signals[base_sid]["B"] = "00000000"
+    # EVENT-DRIVEN POP: Every single GET request from Roblox pops the next step immediately!
+    if queues[base_sid]:
+        byte_a, byte_b = queues[base_sid].popleft()
+        current_signals[base_sid]["A"] = byte_a
+        current_signals[base_sid]["B"] = byte_b
+    else:
+        current_signals[base_sid]["A"] = "00000000"
+        current_signals[base_sid]["B"] = "00000000"
 
     return jsonify({"value": current_signals[base_sid][channel]})
 
