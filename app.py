@@ -89,17 +89,16 @@ def color_to_8bit(color_name, reset_active=False):
     return (c_bits + r_bit + unused_bit)[::-1]
 
 def get_reset_steps():
-    space_active, space_pause = text_to_8bit_steps(' ')
+    """
+    Sends a reset pulse on Transmitter B (Bit 7 = 1) WITHOUT activating Clock on Transmitter A!
+    This resets the panel write head to (0,0) without skipping pixels.
+    """
     reset_on = color_to_8bit("black", reset_active=True)
     reset_off = color_to_8bit("black", reset_active=False)
-    # Give a solid multi-step reset pulse so the in-game logic registers it reliably
     return [
-        (space_active, reset_on),
-        (space_pause, reset_on),
-        (space_active, reset_on),
-        (space_pause, reset_on),
-        (space_active, reset_off),
-        (space_pause, reset_off)
+        ("00000000", reset_on),
+        ("00000000", reset_on),
+        ("00000000", reset_off)
     ]
 
 # --- HTML TEMPLATES ---
@@ -144,7 +143,7 @@ MAIN_HUB_TEMPLATE = """
             </div>
             <div class="card">
                 <h3>🎨 Colored Typewriter</h3>
-                <p>16x16 RGB Panel grid painting tool with synchronized color & auto-reset.</p>
+                <p>16x16 RGB Panel grid painting tool with precise pixel alignment.</p>
                 <a href="/colored-typewriter" class="btn">Open Panel</a>
             </div>
             <div class="card">
@@ -318,7 +317,7 @@ COLORED_TYPEWRITER_TEMPLATE = """
                 })
             });
             let data = await res.json();
-            alert("Grid paint enqueued! Previous job stopped. Queue length: " + data.queue_len);
+            alert("Grid paint enqueued cleanly! Queue length: " + data.queue_len);
         }
 
         async function triggerReset() {
@@ -368,14 +367,14 @@ COLORED_TYPEWRITER_TEMPLATE = """
             <div class="section-title">2. 16x16 Grid Paint Tool</div>
             <div id="grid-16" class="grid-16"></div>
             <div class="btn-group">
-                <button onclick="sendGrid()">🚀 Send Grid Paint (Stops Previous)</button>
+                <button onclick="sendGrid()">🚀 Send Grid Paint</button>
                 <button class="btn-danger" onclick="triggerReset()">🔄 Trigger Manual Reset</button>
             </div>
         </div>
 
         <label class="toggle-group">
             <input type="checkbox" id="auto-reset-toggle" checked>
-            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B to reset panel pointer to 0,0 before drawing)</span>
+            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B to reset panel write pointer to 0,0 without advancing clock)</span>
         </label>
     </div>
 </body>
@@ -459,7 +458,7 @@ def api_send_colored_grid():
     if sid and pixels:
         base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
         
-        # STOP previous job by clearing queue immediately
+        # Clear previous queue
         queues[base_sid].clear()
 
         steps = []
