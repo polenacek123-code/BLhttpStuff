@@ -5,14 +5,13 @@ from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
-# Unified storage per base session ID:
-# queues[base_sid] = deque of tuples: (byte_A, byte_B)
+# Shared queue per base_sid: deque of (byte_A, byte_B)
 queues = collections.defaultdict(collections.deque)
 current_signals = collections.defaultdict(lambda: {"A": "00000000", "B": "00000000"})
 last_pop_time = collections.defaultdict(float)
 last_roblox_ping = collections.defaultdict(lambda: "Never")
 
-INTERVAL_SEC = 0.20  # Faster 200 ms interval per step
+INTERVAL_SEC = 0.20  # 200 ms interval per step
 
 # --- CUSTOM CHARACTER & SYMBOL MAPPING ---
 def get_char_mapping(char):
@@ -258,8 +257,11 @@ COLORED_TYPEWRITER_TEMPLATE = """
         .toggle-group { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; font-size: 13px; color: #c9d1d9; cursor: pointer; }
         .toggle-group input { width: 18px; height: 18px; accent-color: #238636; cursor: pointer; }
 
-        button { width: 100%; padding: 14px; border-radius: 6px; border: none; font-weight: 600; background: #238636; color: #fff; cursor: pointer; font-size: 15px; }
+        .btn-group { display: flex; gap: 10px; }
+        button { flex: 1; padding: 12px; border-radius: 6px; border: none; font-weight: 600; background: #238636; color: #fff; cursor: pointer; font-size: 14px; }
         button:hover { background: #2ea043; }
+        .btn-danger { background: #da3633; }
+        .btn-danger:hover { background: #f85149; }
     </style>
     <script>
         let selectedColor = 'white';
@@ -295,29 +297,57 @@ COLORED_TYPEWRITER_TEMPLATE = """
             return map[name] || '#000000';
         }
 
-        async function sendAllToRoblox() {
+        async function sendColoredText() {
             let sid = document.getElementById('sid-input').value.trim();
             let text = document.getElementById('text-input').value;
             let autoReset = document.getElementById('auto-reset-toggle').checked;
             
-            if(!sid) { alert("Please enter Session ID (SID)"); return; }
+            if(!sid || !text) { alert("Please enter SID and Text"); return; }
 
-            let pixels = [];
-            document.querySelectorAll('.pixel').forEach(p => pixels.push(p.dataset.colorName));
-
-            let res = await fetch('/api/colored-typewriter/send-all', {
+            let res = await fetch('/api/colored-typewriter/send-text', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     sid: sid,
                     text: text,
                     color: selectedColor,
+                    auto_reset: autoReset
+                })
+            });
+            let data = await res.json();
+            alert("Text enqueued! Overwrote previous queue.");
+        }
+
+        async function sendGrid() {
+            let sid = document.getElementById('sid-input').value.trim();
+            let autoReset = document.getElementById('auto-reset-toggle').checked;
+            if(!sid) { alert("Please enter Session ID (SID)"); return; }
+
+            let pixels = [];
+            document.querySelectorAll('.pixel').forEach(p => pixels.push(p.dataset.colorName));
+
+            let res = await fetch('/api/colored-typewriter/send-grid', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    sid: sid,
                     pixels: pixels,
                     auto_reset: autoReset
                 })
             });
             let data = await res.json();
-            alert("Successfully enqueued to Roblox! Queue length: " + data.queue_len + " steps.");
+            alert("Grid paint enqueued! Overwrote previous queue.");
+        }
+
+        async function triggerReset() {
+            let sid = document.getElementById('sid-input').value.trim();
+            if(!sid) { alert("Please enter SID"); return; }
+            await fetch('/api/colored-typewriter/reset', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({sid: sid})
+            });
+            alert("Reset signal sent!");
         }
     </script>
 </head>
@@ -332,7 +362,7 @@ COLORED_TYPEWRITER_TEMPLATE = """
         </div>
 
         <div class="section-card">
-            <div class="section-title">1. Choose Active Color (for Text Tool)</div>
+            <div class="section-title">1. Choose Active Color</div>
             <div class="palette">
                 <div class="color-btn" style="background:#000000;" onclick="setPaletteColor('black', '#000000', this)"></div>
                 <div class="color-btn active" style="background:#ffffff;" onclick="setPaletteColor('white', '#ffffff', this)"></div>
@@ -355,19 +385,22 @@ COLORED_TYPEWRITER_TEMPLATE = """
         <div class="section-card">
             <div class="section-title">2. Text Tool (Transmits Text + Selected Color)</div>
             <input type="text" id="text-input" placeholder="Type text to display..." autocomplete="off">
+            <button onclick="sendColoredText()">Transmit Colored Text</button>
         </div>
 
         <div class="section-card">
             <div class="section-title">3. 16x16 Grid Paint Tool</div>
             <div id="grid-16" class="grid-16"></div>
+            <div class="btn-group">
+                <button onclick="sendGrid()">Send Grid Paint</button>
+                <button class="btn-danger" onclick="triggerReset()">Trigger Manual Reset</button>
+            </div>
         </div>
 
         <label class="toggle-group">
             <input type="checkbox" id="auto-reset-toggle" checked>
-            <span>Auto-Reset on Send (Automatically pulse Bit 7 on Transmitter B before loading new data)</span>
+            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B before loading new transmission)</span>
         </label>
-
-        <button onclick="sendAllToRoblox()">🚀 Send All to Roblox (Text & Grid)</button>
     </div>
 </body>
 </html>
@@ -429,6 +462,9 @@ def send_text():
     
     if sid and text:
         base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
+        # Clear previous queue on basic typewriter too
+        queues[base_sid].clear()
+        
         steps = []
         for char in text:
             active_step, pause_step = text_to_8bit_steps(char)
@@ -438,43 +474,73 @@ def send_text():
 
     return f"<script>window.location.href='/typewriter?sid={sid}';</script>"
 
-@app.route('/api/colored-typewriter/send-all', methods=['POST'])
-def api_send_all():
+@app.route('/api/colored-typewriter/send-text', methods=['POST'])
+def api_send_colored_text():
     data = request.get_json() or {}
     sid = data.get('sid', '').strip()
     text = data.get('text', '')
     color_name = data.get('color', 'white')
-    pixels = data.get('pixels', [])
     auto_reset = data.get('auto_reset', False)
 
-    if sid:
+    if sid and text:
         base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
-        steps = []
+        
+        # STOP previous request! Clear existing queue.
+        queues[base_sid].clear()
 
-        # 1. Optional Auto-Reset at the beginning
+        steps = []
         if auto_reset:
             steps.extend(get_reset_steps())
 
-        # 2. Text Steps (if text is provided)
-        if text:
-            color_byte = color_to_8bit(color_name, reset_active=False)
-            for char in text:
-                active_a, pause_a = text_to_8bit_steps(char)
-                steps.append((active_a, color_byte))
-                steps.append((pause_a, color_byte))
-
-        # 3. Grid Steps (all 256 pixels)
-        if pixels:
-            space_active, space_pause = text_to_8bit_steps(' ')
-            for col_name in pixels:
-                color_byte = color_to_8bit(col_name, reset_active=False)
-                steps.append((space_active, color_byte))
-                steps.append((space_pause, color_byte))
+        color_byte = color_to_8bit(color_name, reset_active=False)
+        for char in text:
+            active_a, pause_a = text_to_8bit_steps(char)
+            steps.append((active_a, color_byte))
+            steps.append((pause_a, color_byte))
 
         queues[base_sid].extend(steps)
         return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
 
-    return jsonify({"status": "error", "message": "Invalid SID"}), 400
+    return jsonify({"status": "error"}), 400
+
+@app.route('/api/colored-typewriter/send-grid', methods=['POST'])
+def api_send_colored_grid():
+    data = request.get_json() or {}
+    sid = data.get('sid', '').strip()
+    pixels = data.get('pixels', [])
+    auto_reset = data.get('auto_reset', False)
+
+    if sid and pixels:
+        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
+        
+        # STOP previous request! Clear existing queue.
+        queues[base_sid].clear()
+
+        steps = []
+        if auto_reset:
+            steps.extend(get_reset_steps())
+
+        space_active, space_pause = text_to_8bit_steps(' ')
+        for col_name in pixels:
+            color_byte = color_to_8bit(col_name, reset_active=False)
+            steps.append((space_active, color_byte))
+            steps.append((space_pause, color_byte))
+
+        queues[base_sid].extend(steps)
+        return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
+
+    return jsonify({"status": "error"}), 400
+
+@app.route('/api/colored-typewriter/reset', methods=['POST'])
+def api_reset_signal():
+    data = request.get_json() or {}
+    sid = data.get('sid', '').strip()
+    if sid:
+        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
+        queues[base_sid].clear()
+        queues[base_sid].extend(get_reset_steps())
+
+    return jsonify({"status": "reset_sent"})
 
 # --- UNIFIED ROBLOX HTTP TRANSMITTER ENDPOINT ---
 @app.route('/api/typewriter', methods=['GET'])
@@ -483,7 +549,6 @@ def get_typewriter_signal():
     if not header_sid:
         return jsonify({"value": "00000000"})
 
-    # Determine base SID and channel (A or B)
     if header_sid.endswith('A') or header_sid.endswith('B'):
         base_sid = header_sid[:-1]
         channel = header_sid[-1]
@@ -494,7 +559,6 @@ def get_typewriter_signal():
     last_roblox_ping[base_sid] = datetime.now().strftime("%H:%M:%S")
 
     now = time.time()
-    # Shared interval check: advances BOTH A and B simultaneously from the same queue step
     if now - last_pop_time[base_sid] >= INTERVAL_SEC:
         if queues[base_sid]:
             byte_a, byte_b = queues[base_sid].popleft()
