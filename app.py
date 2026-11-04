@@ -13,7 +13,7 @@ last_roblox_ping = collections.defaultdict(lambda: "Never")
 
 INTERVAL_SEC = 0.20  # 200 ms interval per step
 
-# --- CUSTOM CHARACTER & SYMBOL MAPPING ---
+# --- CUSTOM CHARACTER & SYMBOL MAPPING (For Typewriter) ---
 def get_char_mapping(char):
     if 'a' <= char <= 'z':
         idx = ord(char) - ord('a') + 1
@@ -92,7 +92,10 @@ def get_reset_steps():
     space_active, space_pause = text_to_8bit_steps(' ')
     reset_on = color_to_8bit("black", reset_active=True)
     reset_off = color_to_8bit("black", reset_active=False)
+    # Give a solid multi-step reset pulse so the in-game logic registers it reliably
     return [
+        (space_active, reset_on),
+        (space_pause, reset_on),
         (space_active, reset_on),
         (space_pause, reset_on),
         (space_active, reset_off),
@@ -141,7 +144,7 @@ MAIN_HUB_TEMPLATE = """
             </div>
             <div class="card">
                 <h3>🎨 Colored Typewriter</h3>
-                <p>Synchronized dual-transmitter text & color panel with grid painting and auto-reset.</p>
+                <p>16x16 RGB Panel grid painting tool with synchronized color & auto-reset.</p>
                 <a href="/colored-typewriter" class="btn">Open Panel</a>
             </div>
             <div class="card">
@@ -159,8 +162,8 @@ MAIN_HUB_TEMPLATE = """
             <h2>⚙️ Roblox Setup</h2>
             <ol>
                 <li>URL Endpoint for transmitters: <br><code>{{ base_url }}/api/typewriter</code></li>
-                <li>Transmitter A Header: <code>SID: MY_SESSION_A</code> (Text + Clock)</li>
-                <li>Transmitter B Header: <code>SID: MY_SESSION_B</code> (Color + Reset)</li>
+                <li>Transmitter A Header: <code>SID: MY_SESSION_A</code> (Clock / Pulse)</li>
+                <li>Transmitter B Header: <code>SID: MY_SESSION_B</code> (Color + Reset Bit 7)</li>
             </ol>
         </div>
     </div>
@@ -297,27 +300,6 @@ COLORED_TYPEWRITER_TEMPLATE = """
             return map[name] || '#000000';
         }
 
-        async function sendColoredText() {
-            let sid = document.getElementById('sid-input').value.trim();
-            let text = document.getElementById('text-input').value;
-            let autoReset = document.getElementById('auto-reset-toggle').checked;
-            
-            if(!sid || !text) { alert("Please enter SID and Text"); return; }
-
-            let res = await fetch('/api/colored-typewriter/send-text', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    sid: sid,
-                    text: text,
-                    color: selectedColor,
-                    auto_reset: autoReset
-                })
-            });
-            let data = await res.json();
-            alert("Text enqueued! Overwrote previous queue.");
-        }
-
         async function sendGrid() {
             let sid = document.getElementById('sid-input').value.trim();
             let autoReset = document.getElementById('auto-reset-toggle').checked;
@@ -336,7 +318,7 @@ COLORED_TYPEWRITER_TEMPLATE = """
                 })
             });
             let data = await res.json();
-            alert("Grid paint enqueued! Overwrote previous queue.");
+            alert("Grid paint enqueued! Previous job stopped. Queue length: " + data.queue_len);
         }
 
         async function triggerReset() {
@@ -347,14 +329,14 @@ COLORED_TYPEWRITER_TEMPLATE = """
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({sid: sid})
             });
-            alert("Reset signal sent!");
+            alert("Manual reset signal sent to panel!");
         }
     </script>
 </head>
 <body>
     <div class="container">
         <a href="/" class="back-link">← Back to Hub</a>
-        <h1>🎨 Colored Typewriter Panel</h1>
+        <h1>🎨 Colored Typewriter Panel (16x16 Grid)</h1>
         
         <div style="margin-bottom: 15px;">
             <label>Session ID (SID):</label>
@@ -362,7 +344,7 @@ COLORED_TYPEWRITER_TEMPLATE = """
         </div>
 
         <div class="section-card">
-            <div class="section-title">1. Choose Active Color</div>
+            <div class="section-title">1. Choose Active Paint Color</div>
             <div class="palette">
                 <div class="color-btn" style="background:#000000;" onclick="setPaletteColor('black', '#000000', this)"></div>
                 <div class="color-btn active" style="background:#ffffff;" onclick="setPaletteColor('white', '#ffffff', this)"></div>
@@ -383,23 +365,17 @@ COLORED_TYPEWRITER_TEMPLATE = """
         </div>
 
         <div class="section-card">
-            <div class="section-title">2. Text Tool (Transmits Text + Selected Color)</div>
-            <input type="text" id="text-input" placeholder="Type text to display..." autocomplete="off">
-            <button onclick="sendColoredText()">Transmit Colored Text</button>
-        </div>
-
-        <div class="section-card">
-            <div class="section-title">3. 16x16 Grid Paint Tool</div>
+            <div class="section-title">2. 16x16 Grid Paint Tool</div>
             <div id="grid-16" class="grid-16"></div>
             <div class="btn-group">
-                <button onclick="sendGrid()">Send Grid Paint</button>
-                <button class="btn-danger" onclick="triggerReset()">Trigger Manual Reset</button>
+                <button onclick="sendGrid()">🚀 Send Grid Paint (Stops Previous)</button>
+                <button class="btn-danger" onclick="triggerReset()">🔄 Trigger Manual Reset</button>
             </div>
         </div>
 
         <label class="toggle-group">
             <input type="checkbox" id="auto-reset-toggle" checked>
-            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B before loading new transmission)</span>
+            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B to reset panel pointer to 0,0 before drawing)</span>
         </label>
     </div>
 </body>
@@ -462,7 +438,6 @@ def send_text():
     
     if sid and text:
         base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
-        # Clear previous queue on basic typewriter too
         queues[base_sid].clear()
         
         steps = []
@@ -474,46 +449,17 @@ def send_text():
 
     return f"<script>window.location.href='/typewriter?sid={sid}';</script>"
 
-@app.route('/api/colored-typewriter/send-text', methods=['POST'])
-def api_send_colored_text():
-    data = request.get_json() or {}
-    sid = data.get('sid', '').strip()
-    text = data.get('text', '')
-    color_name = data.get('color', 'white')
-    auto_reset = data.get('auto_reset', False)
-
-    if sid and text:
-        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
-        
-        # STOP previous request! Clear existing queue.
-        queues[base_sid].clear()
-
-        steps = []
-        if auto_reset:
-            steps.extend(get_reset_steps())
-
-        color_byte = color_to_8bit(color_name, reset_active=False)
-        for char in text:
-            active_a, pause_a = text_to_8bit_steps(char)
-            steps.append((active_a, color_byte))
-            steps.append((pause_a, color_byte))
-
-        queues[base_sid].extend(steps)
-        return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
-
-    return jsonify({"status": "error"}), 400
-
 @app.route('/api/colored-typewriter/send-grid', methods=['POST'])
 def api_send_colored_grid():
     data = request.get_json() or {}
     sid = data.get('sid', '').strip()
     pixels = data.get('pixels', [])
-    auto_reset = data.get('auto_reset', False)
+    auto_reset = data.get('auto_reset', True)
 
     if sid and pixels:
         base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
         
-        # STOP previous request! Clear existing queue.
+        # STOP previous job by clearing queue immediately
         queues[base_sid].clear()
 
         steps = []
