@@ -458,12 +458,16 @@ def api_send_colored_grid():
         if auto_reset:
             steps.extend(get_reset_steps())
 
-        # EVENT-DRIVEN POLLING: Each pixel is exactly 1 step in the queue!
-        # When Roblox polls via GET, it consumes this step directly.
+        # EVENT-DRIVEN CLOCK PULSE: 2 steps per pixel (Active High -> Pause Low)
+        clock_active_a = "10000000"
+        clock_pause_a = "00000000"
+
         for col_name in pixels:
             color_byte = color_to_8bit(col_name, reset_active=False)
-            # Transmitter A = Clock Active (10000000), Transmitter B = Color Byte
-            steps.append(("10000000", color_byte))
+            # Step 1: Clock High (Pulse ON)
+            steps.append((clock_active_a, color_byte))
+            # Step 2: Clock Low (Pulse OFF / Pause)
+            steps.append((clock_pause_a, color_byte))
 
         queues[base_sid].extend(steps)
         return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
@@ -497,7 +501,6 @@ def get_typewriter_signal():
 
     last_roblox_ping[base_sid] = datetime.now().strftime("%H:%M:%S")
 
-    # EVENT-DRIVEN POP: Every single GET request from Roblox pops the next step immediately!
     if queues[base_sid]:
         byte_a, byte_b = queues[base_sid].popleft()
         current_signals[base_sid]["A"] = byte_a
