@@ -90,13 +90,12 @@ def color_to_8bit(color_name, reset_active=False):
 
 def get_reset_steps():
     """
-    Sends a reset pulse on Transmitter B (Bit 7 = 1) WITHOUT activating Clock on Transmitter A!
-    This resets the panel write head to (0,0) without skipping pixels.
+    Sends a reset frame: Bit 7 on Transmitter B high, Transmitter A low (Clock=0).
+    Resets write pointer to (0,0) without consuming clock cycles.
     """
     reset_on = color_to_8bit("black", reset_active=True)
     reset_off = color_to_8bit("black", reset_active=False)
     return [
-        ("00000000", reset_on),
         ("00000000", reset_on),
         ("00000000", reset_off)
     ]
@@ -374,7 +373,7 @@ COLORED_TYPEWRITER_TEMPLATE = """
 
         <label class="toggle-group">
             <input type="checkbox" id="auto-reset-toggle" checked>
-            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B to reset panel write pointer to 0,0 without advancing clock)</span>
+            <span>Auto-Reset on Send (Pulse Bit 7 on Transmitter B to reset write pointer to 0,0 without advancing clock)</span>
         </label>
     </div>
 </body>
@@ -465,11 +464,14 @@ def api_send_colored_grid():
         if auto_reset:
             steps.extend(get_reset_steps())
 
-        space_active, space_pause = text_to_8bit_steps(' ')
+        # Exact 10000000 (Bit 8 Clock active) and 00000000 (Clock low) for pixel timing
+        clock_active = "10000000"
+        clock_pause = "00000000"
+
         for col_name in pixels:
             color_byte = color_to_8bit(col_name, reset_active=False)
-            steps.append((space_active, color_byte))
-            steps.append((space_pause, color_byte))
+            steps.append((clock_active, color_byte))
+            steps.append((clock_pause, color_byte))
 
         queues[base_sid].extend(steps)
         return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
