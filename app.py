@@ -5,13 +5,14 @@ from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
-# Storage for queues and signals
+# Unified storage per base session ID:
+# queues[base_sid] = deque of tuples: (byte_A, byte_B)
 queues = collections.defaultdict(collections.deque)
-current_signal = collections.defaultdict(lambda: "00000000")
+current_signals = collections.defaultdict(lambda: {"A": "00000000", "B": "00000000"})
 last_pop_time = collections.defaultdict(float)
 last_roblox_ping = collections.defaultdict(lambda: "Never")
 
-INTERVAL_SEC = 0.35  # 350 ms step interval
+INTERVAL_SEC = 0.20  # Faster 200 ms interval per step
 
 # --- CUSTOM CHARACTER & SYMBOL MAPPING ---
 def get_char_mapping(char):
@@ -83,16 +84,21 @@ COLOR_MAP = {
 }
 
 def color_to_8bit(color_name, reset_active=False):
-    """
-    Transmitter B format (Reversed for Roblox):
-    - Bits 1-6: Color code
-    - Bit 7: Reset button (1 if reset triggered)
-    - Bit 8: Unused / 0 (Clock is driven solely by Transmitter A)
-    """
     c_bits = COLOR_MAP.get(color_name, "000000")
     r_bit = "1" if reset_active else "0"
     unused_bit = "0"
     return (c_bits + r_bit + unused_bit)[::-1]
+
+def get_reset_steps():
+    space_active, space_pause = text_to_8bit_steps(' ')
+    reset_on = color_to_8bit("black", reset_active=True)
+    reset_off = color_to_8bit("black", reset_active=False)
+    return [
+        (space_active, reset_on),
+        (space_pause, reset_on),
+        (space_active, reset_off),
+        (space_pause, reset_off)
+    ]
 
 # --- HTML TEMPLATES ---
 
@@ -136,7 +142,7 @@ MAIN_HUB_TEMPLATE = """
             </div>
             <div class="card">
                 <h3>🎨 Colored Typewriter</h3>
-                <p>Simultaneous text & color transmitter with interactive 16x16 grid and reset control.</p>
+                <p>Synchronized dual-transmitter text & color panel with grid painting and auto-reset.</p>
                 <a href="/colored-typewriter" class="btn">Open Panel</a>
             </div>
             <div class="card">
@@ -195,7 +201,7 @@ TYPEWRITER_TEMPLATE = """
                 document.getElementById('queue-len').innerText = data.queue_len;
                 document.getElementById('last-ping').innerText = data.last_ping;
             } catch(e) {}
-        }, 300);
+        }, 200);
     </script>
 </head>
 <body>
@@ -249,11 +255,11 @@ COLORED_TYPEWRITER_TEMPLATE = """
         .pixel { aspect-ratio: 1; background: #161b22; border: 1px solid #21262d; border-radius: 3px; cursor: pointer; }
         .pixel:hover { border-color: #58a6ff; }
         
-        .btn-group { display: flex; gap: 10px; }
-        button { flex: 1; padding: 12px; border-radius: 6px; border: none; font-weight: 600; background: #238636; color: #fff; cursor: pointer; font-size: 14px; }
+        .toggle-group { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; font-size: 13px; color: #c9d1d9; cursor: pointer; }
+        .toggle-group input { width: 18px; height: 18px; accent-color: #238636; cursor: pointer; }
+
+        button { width: 100%; padding: 14px; border-radius: 6px; border: none; font-weight: 600; background: #238636; color: #fff; cursor: pointer; font-size: 15px; }
         button:hover { background: #2ea043; }
-        .btn-danger { background: #da3633; }
-        .btn-danger:hover { background: #f85149; }
     </style>
     <script>
         let selectedColor = 'white';
@@ -289,42 +295,29 @@ COLORED_TYPEWRITER_TEMPLATE = """
             return map[name] || '#000000';
         }
 
-        async function sendColoredText() {
+        async function sendAllToRoblox() {
             let sid = document.getElementById('sid-input').value.trim();
             let text = document.getElementById('text-input').value;
-            if(!sid || !text) { alert("Please fill in SID and Text"); return; }
+            let autoReset = document.getElementById('auto-reset-toggle').checked;
             
-            await fetch('/api/colored-typewriter/send-text', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({sid: sid, text: text, color: selectedColor})
-            });
-            alert("Colored text enqueued!");
-        }
+            if(!sid) { alert("Please enter Session ID (SID)"); return; }
 
-        async function sendGrid() {
-            let sid = document.getElementById('sid-input').value.trim();
-            if(!sid) { alert("Please enter SID"); return; }
             let pixels = [];
             document.querySelectorAll('.pixel').forEach(p => pixels.push(p.dataset.colorName));
 
-            await fetch('/api/colored-typewriter/send-grid', {
+            let res = await fetch('/api/colored-typewriter/send-all', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({sid: sid, pixels: pixels})
+                body: JSON.stringify({
+                    sid: sid,
+                    text: text,
+                    color: selectedColor,
+                    pixels: pixels,
+                    auto_reset: autoReset
+                })
             });
-            alert("Grid colors enqueued!");
-        }
-
-        async function triggerReset() {
-            let sid = document.getElementById('sid-input').value.trim();
-            if(!sid) { alert("Please enter SID"); return; }
-            await fetch('/api/colored-typewriter/reset', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({sid: sid})
-            });
-            alert("Reset signal sent to Transmitter B (Bit 7)!");
+            let data = await res.json();
+            alert("Successfully enqueued to Roblox! Queue length: " + data.queue_len + " steps.");
         }
     </script>
 </head>
@@ -339,7 +332,7 @@ COLORED_TYPEWRITER_TEMPLATE = """
         </div>
 
         <div class="section-card">
-            <div class="section-title">1. Choose Active Color</div>
+            <div class="section-title">1. Choose Active Color (for Text Tool)</div>
             <div class="palette">
                 <div class="color-btn" style="background:#000000;" onclick="setPaletteColor('black', '#000000', this)"></div>
                 <div class="color-btn active" style="background:#ffffff;" onclick="setPaletteColor('white', '#ffffff', this)"></div>
@@ -361,18 +354,20 @@ COLORED_TYPEWRITER_TEMPLATE = """
 
         <div class="section-card">
             <div class="section-title">2. Text Tool (Transmits Text + Selected Color)</div>
-            <input type="text" id="text-input" placeholder="Type colored text..." autocomplete="off">
-            <button onclick="sendColoredText()">Transmit Colored Text</button>
+            <input type="text" id="text-input" placeholder="Type text to display..." autocomplete="off">
         </div>
 
         <div class="section-card">
             <div class="section-title">3. 16x16 Grid Paint Tool</div>
             <div id="grid-16" class="grid-16"></div>
-            <div class="btn-group">
-                <button onclick="sendGrid()">Send Grid Palette</button>
-                <button class="btn-danger" onclick="triggerReset()">Trigger Reset (Bit 7)</button>
-            </div>
         </div>
+
+        <label class="toggle-group">
+            <input type="checkbox" id="auto-reset-toggle" checked>
+            <span>Auto-Reset on Send (Automatically pulse Bit 7 on Transmitter B before loading new data)</span>
+        </label>
+
+        <button onclick="sendAllToRoblox()">🚀 Send All to Roblox (Text & Grid)</button>
     </div>
 </body>
 </html>
@@ -433,111 +428,99 @@ def send_text():
     text = request.form.get('text', '')
     
     if sid and text:
-        target_sid = sid + "A"
+        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
+        steps = []
         for char in text:
             active_step, pause_step = text_to_8bit_steps(char)
-            queues[target_sid].append(active_step)
-            queues[target_sid].append(pause_step)
+            steps.append((active_step, "00000000"))
+            steps.append((pause_step, "00000000"))
+        queues[base_sid].extend(steps)
 
     return f"<script>window.location.href='/typewriter?sid={sid}';</script>"
 
-@app.route('/api/colored-typewriter/send-text', methods=['POST'])
-def api_send_colored_text():
+@app.route('/api/colored-typewriter/send-all', methods=['POST'])
+def api_send_all():
     data = request.get_json() or {}
     sid = data.get('sid', '').strip()
     text = data.get('text', '')
     color_name = data.get('color', 'white')
-
-    if sid and text:
-        target_a = sid + "A"
-        target_b = sid + "B"
-
-        color_byte = color_to_8bit(color_name, reset_active=False)
-
-        for char in text:
-            active_step, pause_step = text_to_8bit_steps(char)
-            
-            # Transmitter A: Text & Clock
-            queues[target_a].append(active_step)
-            queues[target_a].append(pause_step)
-
-            # Transmitter B: Synchronized Color (no clock on B)
-            queues[target_b].append(color_byte)
-            queues[target_b].append("00000000")
-
-    return jsonify({"status": "success"})
-
-@app.route('/api/colored-typewriter/send-grid', methods=['POST'])
-def api_send_colored_grid():
-    data = request.get_json() or {}
-    sid = data.get('sid', '').strip()
     pixels = data.get('pixels', [])
-    
-    if sid and pixels:
-        target_a = sid + "A"
-        target_b = sid + "B"
-        
-        space_active, space_pause = text_to_8bit_steps(' ')
+    auto_reset = data.get('auto_reset', False)
 
-        for col_name in pixels:
-            color_byte = color_to_8bit(col_name, reset_active=False)
-
-            # Step Transmitter A (Clock Pulse on space)
-            queues[target_a].append(space_active)
-            queues[target_a].append(space_pause)
-
-            # Step Transmitter B (Color Byte)
-            queues[target_b].append(color_byte)
-            queues[target_b].append("00000000")
-
-    return jsonify({"status": "success"})
-
-@app.route('/api/colored-typewriter/reset', methods=['POST'])
-def api_reset_signal():
-    data = request.get_json() or {}
-    sid = data.get('sid', '').strip()
     if sid:
-        target_a = sid + "A"
-        target_b = sid + "B"
-        
-        # Trigger Reset: Bit 7 on Transmitter B active + Pulse on Transmitter A
-        space_active, space_pause = text_to_8bit_steps(' ')
-        reset_byte = color_to_8bit("black", reset_active=True)
+        base_sid = sid[:-1] if (sid.endswith('A') or sid.endswith('B')) else sid
+        steps = []
 
-        queues[target_a].appendleft(space_pause)
-        queues[target_a].appendleft(space_active)
+        # 1. Optional Auto-Reset at the beginning
+        if auto_reset:
+            steps.extend(get_reset_steps())
 
-        queues[target_b].appendleft("00000000")
-        queues[target_b].appendleft(reset_byte)
+        # 2. Text Steps (if text is provided)
+        if text:
+            color_byte = color_to_8bit(color_name, reset_active=False)
+            for char in text:
+                active_a, pause_a = text_to_8bit_steps(char)
+                steps.append((active_a, color_byte))
+                steps.append((pause_a, color_byte))
 
-    return jsonify({"status": "reset_sent"})
+        # 3. Grid Steps (all 256 pixels)
+        if pixels:
+            space_active, space_pause = text_to_8bit_steps(' ')
+            for col_name in pixels:
+                color_byte = color_to_8bit(col_name, reset_active=False)
+                steps.append((space_active, color_byte))
+                steps.append((space_pause, color_byte))
 
-# --- ROBLOX HTTP TRANSMITTER ENDPOINTS ---
+        queues[base_sid].extend(steps)
+        return jsonify({"status": "success", "queue_len": len(queues[base_sid])})
+
+    return jsonify({"status": "error", "message": "Invalid SID"}), 400
+
+# --- UNIFIED ROBLOX HTTP TRANSMITTER ENDPOINT ---
 @app.route('/api/typewriter', methods=['GET'])
 def get_typewriter_signal():
-    sid = request.headers.get('SID', '').strip()
-    if not sid:
+    header_sid = request.headers.get('SID', '').strip()
+    if not header_sid:
         return jsonify({"value": "00000000"})
 
-    last_roblox_ping[sid] = datetime.now().strftime("%H:%M:%S")
+    # Determine base SID and channel (A or B)
+    if header_sid.endswith('A') or header_sid.endswith('B'):
+        base_sid = header_sid[:-1]
+        channel = header_sid[-1]
+    else:
+        base_sid = header_sid
+        channel = 'A'
+
+    last_roblox_ping[base_sid] = datetime.now().strftime("%H:%M:%S")
 
     now = time.time()
-    if now - last_pop_time[sid] >= INTERVAL_SEC:
-        if queues[sid]:
-            current_signal[sid] = queues[sid].popleft()
-            last_pop_time[sid] = now
+    # Shared interval check: advances BOTH A and B simultaneously from the same queue step
+    if now - last_pop_time[base_sid] >= INTERVAL_SEC:
+        if queues[base_sid]:
+            byte_a, byte_b = queues[base_sid].popleft()
+            current_signals[base_sid]["A"] = byte_a
+            current_signals[base_sid]["B"] = byte_b
+            last_pop_time[base_sid] = now
         else:
-            current_signal[sid] = "00000000"
+            current_signals[base_sid]["A"] = "00000000"
+            current_signals[base_sid]["B"] = "00000000"
 
-    return jsonify({"value": current_signal[sid]})
+    return jsonify({"value": current_signals[base_sid][channel]})
 
 @app.route('/api/typewriter/status', methods=['GET'])
 def typewriter_status():
     sid = request.args.get('sid', '').strip()
+    if sid.endswith('A') or sid.endswith('B'):
+        base_sid = sid[:-1]
+        channel = sid[-1]
+    else:
+        base_sid = sid
+        channel = 'A'
+
     return jsonify({
-        "current_signal": current_signal[sid],
-        "queue_len": len(queues[sid]),
-        "last_ping": last_roblox_ping[sid]
+        "current_signal": current_signals[base_sid][channel],
+        "queue_len": len(queues[base_sid]),
+        "last_ping": last_roblox_ping[base_sid]
     })
 
 if __name__ == '__main__':
